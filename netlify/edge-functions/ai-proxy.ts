@@ -1,12 +1,7 @@
 // Netlify Edge Function: pass-through proxy to the project's AI Gateway.
-// Deploy at netlify/edge-functions/ai-proxy.ts, then call:
-//   POST https://<your-site>/ai/v1/chat/completions
-//   POST https://<your-site>/ai/v1/messages        (Anthropic shape)
-// Keeps the short-lived gateway JWT server-side, so clients never see it.
-// Optional shared secret: set PROXY_SECRET env var in the Netlify UI and send x-proxy-secret.
+// Deploy at netlify/edge-functions/ai-proxy.ts
 
 export default async (req: Request, _ctx: any) => {
-  // read per-request: the gateway JWT rotates and must not be cached at module scope
   const GATEWAY_KEY = Deno.env.get('NETLIFY_AI_GATEWAY_KEY') || '';
   const PROXY_SECRET = Deno.env.get('PROXY_SECRET') || '';
 
@@ -17,7 +12,7 @@ export default async (req: Request, _ctx: any) => {
   }
 
   const url = new URL(req.url);
-  const path = url.pathname.replace(/^\/ai/, '');          // /v1/chat/completions
+  const path = url.pathname.replace(/^\/ai/, '');
   const upstream = `${url.origin}/.netlify/ai${path}${url.search}`;
 
   const headers: Record<string, string> = {
@@ -30,10 +25,25 @@ export default async (req: Request, _ctx: any) => {
   if (anth) headers['anthropic-version'] = anth;
 
   const init: RequestInit = { method: req.method, headers };
+
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    init.body = req.body;
-    // @ts-ignore duplex is required for streamed request bodies in Deno
-    init.duplex = 'half';
+    // Intercept JSON body to convert legacy max_tokens -> max_completion_tokens
+    try {
+      const bodyText = await req.text();
+      const bodyJson = JSON.parse(bodyText);
+      if (bodyJson && typeof bodyJson === 'object') {
+        if ('max_tokens' in bodyJson && !('max_completion_tokens' in bodyJson)) {
+          bodyJson.max_completion_tokens = bodyJson.max_tokens;
+          delete bodyJson.max_tokens;
+        }
+      }
+      init.body = JSON.stringify(bodyJson);
+    } catch (_e) {
+      // fallback to raw body if not JSON
+      init.body = req.body;
+      // @ts-ignore duplex is required for streamed request bodies in Deno
+      init.duplex = 'half';
+    }
   }
 
   const r = await fetch(upstream, init);
